@@ -35,6 +35,12 @@ TELEGRAM_TOKEN   = os.environ.get('TELEGRAM_TOKEN',   '8749055255:AAEYOoJ2eOLwBx
 TELEGRAM_CHAT_ID = os.environ.get('TELEGRAM_CHAT_ID', '6812301705')
 TWELVE_DATA_KEY  = os.environ.get('TWELVE_DATA_KEY',  'da7995eb639b49bd8a976ecb6a80f16f')
 
+# Google Sheets config
+SPREADSHEET_ID   = '1JCJqRfANlV9afimJeW1jnFAJi27oTqjPWwy7b0LdjfY'
+SERVICE_ACCOUNT_EMAIL = 'goldwatch-bot@goldwatch-alert.iam.gserviceaccount.com'
+# Service account JSON key — read from GitHub Secret
+GS_SERVICE_JSON  = os.environ.get('GOOGLE_SERVICE_ACCOUNT_JSON', '')
+
 # ══════════════════════════════════════════════════════════════
 #  ACCOUNT SIZING — $1,000 account · 0.5% risk · Split position
 # ══════════════════════════════════════════════════════════════
@@ -120,6 +126,193 @@ def send_telegram(message):
     except Exception as e:
         log.error(f'Telegram exception: {e}')
     return False
+
+# ══════════════════════════════════════════════════════════════
+#  GOOGLE SHEETS — Service Account Auth + Write
+# ══════════════════════════════════════════════════════════════
+
+_gs_token = None
+_gs_token_expiry = 0
+
+def get_gs_token():
+    """Get a valid Google OAuth2 access token using service account JWT."""
+    global _gs_token, _gs_token_expiry
+    now = time.time()
+
+    # Return cached token if still valid (expires in 1 hour, refresh 5 min early)
+    if _gs_token and now < _gs_token_expiry - 300:
+        return _gs_token
+
+    if not GS_SERVICE_JSON:
+        log.warning('GOOGLE_SERVICE_ACCOUNT_JSON not set — Sheets sync disabled')
+        return None
+
+    try:
+        import base64
+        import hmac
+        import hashlib
+        import struct
+
+        # Parse service account JSON
+        sa = json.loads(GS_SERVICE_JSON)
+        private_key_pem = sa['private_key']
+        client_email    = sa['client_email']
+
+        # Build JWT header + payload
+        iat = int(now)
+        exp = iat + 3600
+        scope = 'https://www.googleapis.com/auth/spreadsheets'
+        token_uri = 'https://oauth2.googleapis.com/token'
+
+        header  = {'alg': 'RS256', 'typ': 'JWT'}
+        payload = {
+            'iss': client_email,
+            'scope': scope,
+            'aud': token_uri,
+            'iat': iat,
+            'exp': exp,
+        }
+
+        def b64url(data):
+            if isinstance(data, dict):
+                data = json.dumps(data, separators=(',', ':')).encode()
+            return base64.urlsafe_b64encode(data).rstrip(b'=').decode()
+
+        signing_input = f'{b64url(header)}.{b64url(payload)}'.encode()
+
+        # Sign with RSA-SHA256 using cryptography library
+        try:
+            from cryptography.hazmat.primitives import hashes, serialization
+            from cryptography.hazmat.primitives.asymmetric import padding
+
+            private_key = serialization.load_pem_private_key(
+                private_key_pem.encode(), password=None
+            )
+            signature = private_key.sign(signing_input, padding.PKCS1v15(), hashes.SHA256())
+        except ImportError:
+            # Fallback: use subprocess openssl if cryptography not available
+            import subprocess, tempfile
+            with tempfile.NamedTemporaryFile(suffix='.pem', mode='w', delete=False) as f:
+                f.write(private_key_pem)
+                key_path = f.name
+            result = subprocess.run(
+                ['openssl', 'dgst', '-sha256', '-sign', key_path],
+                input=signing_input, capture_output=True
+            )
+            signature = result.stdout
+            import os as _os; _os.unlink(key_path)
+
+        jwt_token = f'{signing_input.decode()}.{b64url(signature)}'
+
+        # Exchange JWT for access token
+        resp = requests.post(token_uri, data={
+            'grant_type': 'urn:ietf:params:oauth:grant-type:jwt-bearer',
+            'assertion': jwt_token,
+        }, timeout=10)
+
+        if resp.status_code == 200:
+            data = resp.json()
+            _gs_token = data['access_token']
+            _gs_token_expiry = now + data.get('expires_in', 3600)
+            log.info('Google Sheets token obtained ✓')
+            return _gs_token
+        else:
+            log.warning(f'GS token error: {resp.status_code} {resp.text}')
+            return None
+
+    except Exception as e:
+        log.error(f'GS auth error: {e}')
+        return None
+
+
+def gs_request(method, path, body=None):
+    """Make an authenticated Google Sheets API request."""
+    token = get_gs_token()
+    if not token:
+        return None
+    url = f'https://sheets.googleapis.com/v4/spreadsheets/{SPREADSHEET_ID}{path}'
+    headers = {
+        'Authorization': f'Bearer {token}',
+        'Content-Type': 'application/json',
+    }
+    try:
+        resp = requests.request(
+            method, url, headers=headers,
+            json=body, timeout=15
+        )
+        if resp.status_code in (200, 201):
+            return resp.json()
+        else:
+            log.warning(f'Sheets API {resp.status_code}: {resp.text[:200]}')
+            return None
+    except Exception as e:
+        log.error(f'Sheets request error: {e}')
+        return None
+
+
+def ensure_sheet_tab(tab_name):
+    """Create the sheet tab with headers if it doesn't exist."""
+    # Check existing sheets
+    meta = gs_request('GET', '')
+    if not meta:
+        return False
+    existing = [s['properties']['title'] for s in meta.get('sheets', [])]
+    if tab_name not in existing:
+        # Create the tab
+        gs_request('POST', ':batchUpdate', {
+            'requests': [{'addSheet': {'properties': {'title': tab_name}}}]
+        })
+        # Add headers
+        gs_request('PUT',
+            f'/values/{tab_name}!A1:L1?valueInputOption=RAW',
+            {'values': [['Time (WIB)', 'Pair', 'Strategy', 'Direction',
+                         'Entry', 'SL', 'TP1', 'TP2', 'BE',
+                         'HTF Align', 'VWAP+ORB', 'Status']]}
+        )
+        log.info(f'Created sheet tab: {tab_name}')
+    return True
+
+
+def write_signal_to_sheets(pair, strategy, direction, entry,
+                            sl, tp1, tp2, be, htf_align, vwap_orb):
+    """Append a signal row to the appropriate sheet tab."""
+    if not GS_SERVICE_JSON:
+        return  # Sheets sync not configured
+
+    tab = 'XAU_Signals' if pair == 'XAU/USD' else 'BTC_Signals'
+
+    try:
+        ensure_sheet_tab(tab)
+
+        def fp(p):
+            return f'{p:.2f}' if pair == 'XAU/USD' else f'{p:.0f}'
+
+        row = [
+            wib_str(),          # Time (WIB)
+            pair,               # Pair
+            strategy,           # Strategy
+            direction,          # Direction
+            fp(entry),          # Entry
+            fp(sl),             # SL
+            fp(tp1),            # TP1
+            fp(tp2),            # TP2
+            fp(be),             # BE (breakeven)
+            htf_align,          # HTF Align
+            vwap_orb,           # VWAP+ORB verdict
+            'OPEN',             # Status
+        ]
+
+        result = gs_request('POST',
+            f'/values/{tab}!A:L:append?valueInputOption=RAW&insertDataOption=INSERT_ROWS',
+            {'values': [row]}
+        )
+        if result:
+            log.info(f'Signal written to Sheets ({tab}) ✓')
+        else:
+            log.warning('Failed to write signal to Sheets')
+
+    except Exception as e:
+        log.error(f'write_signal_to_sheets error: {e}')
 
 def format_alert(pair, strategy, direction, entry, sl, tp1, tp2,
                  be, htf_bias, vwap_orb, pos_a, pos_b,
@@ -750,6 +943,12 @@ def scan():
                         htf, vo, pos_a, pos_b, a_gain, b_gain, note
                     )
                     send_telegram(msg)
+                    # Write to Google Sheets so HTML app can load it
+                    write_signal_to_sheets(
+                        'XAU/USD', strat_name, direction,
+                        entry, lvl['sl'], lvl['tp1'], lvl['tp2'], lvl['be'],
+                        htf_aligned(direction, b4h, b1h), vo
+                    )
                     time.sleep(1)
         except Exception as e:
             log.error(f'XAU scan error: {e}')
@@ -784,6 +983,12 @@ def scan():
                         htf, vo, pos_a, pos_b, a_gain, b_gain, note
                     )
                     send_telegram(msg)
+                    # Write to Google Sheets so HTML app can load it
+                    write_signal_to_sheets(
+                        'BTC/USDT', strat_name, direction,
+                        entry, lvl['sl'], lvl['tp1'], lvl['tp2'], lvl['be'],
+                        htf_aligned(direction, b4h, b1h), vo
+                    )
                     time.sleep(1)
         except Exception as e:
             log.error(f'BTC scan error: {e}')
