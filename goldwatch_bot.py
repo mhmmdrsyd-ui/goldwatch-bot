@@ -78,7 +78,7 @@ log = logging.getLogger('GoldWatch')
 #  COOLDOWN — prevent duplicate alerts within 10 minutes
 # ══════════════════════════════════════════════════════════════
 alert_cooldown = {}  # key → timestamp
-COOLDOWN_SECS  = 600  # 10 minutes
+COOLDOWN_SECS  = 60   # 1 minute
 
 def is_cooled(key):
     now = time.time()
