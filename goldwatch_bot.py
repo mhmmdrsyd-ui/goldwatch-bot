@@ -952,10 +952,122 @@ def refresh_htf():
         htf_cache['btc_4h'] = fetch_binance('BTCUSDT', '4h', 50)
     htf_cache['last_htf'] = now
 
+# ══════════════════════════════════════════════════════════════
+#  SL/TP STATUS TRACKING — updates OPEN signals in Sheet
+#  Called every scan with current prices
+#  Columns: A=Time, B=Pair, C=Strat, D=Dir, E=Entry,
+#           F=SL, G=TP1, H=TP2, I=BE, J=HTF, K=VWAP, L=Status
+# ══════════════════════════════════════════════════════════════
+
+def update_open_signals_status(xau_price, btc_price):
+    """Check all OPEN signals in both Sheet tabs and update status if
+    price has crossed SL, TP1, or TP2."""
+    if not GS_SERVICE_JSON:
+        return
+
+    tabs = []
+    if xau_price and ENABLE_XAU: tabs.append(('XAU_Signals', xau_price))
+    if btc_price and ENABLE_BTC:  tabs.append(('BTC_Signals',  btc_price))
+
+    for tab, price in tabs:
+        try:
+            # Read all rows
+            data = gs_request('GET', f'/values/{tab}!A2:L1000')
+            rows = data.get('values', []) if data else []
+            if not rows:
+                continue
+
+            updates = []
+            for i, row in enumerate(rows):
+                if len(row) < 12:
+                    row += [''] * (12 - len(row))
+
+                status = row[11].strip() if row[11] else 'OPEN'
+                # Only process OPEN and TP1_RUN (runner still going)
+                if status not in ('OPEN', 'TP1_RUN'):
+                    continue
+
+                try:
+                    direction = row[3].strip()
+                    entry     = float(row[4])
+                    sl        = float(row[5])
+                    tp1       = float(row[6])
+                    tp2       = float(row[7])
+                    be        = float(row[8]) if row[8] else entry
+                except (ValueError, IndexError):
+                    continue
+
+                new_status = status
+                notify_msg = None
+
+                if status == 'OPEN':
+                    if direction == 'LONG':
+                        if price <= sl:
+                            new_status = 'SL'
+                            notify_msg = f'🛑 {tab.replace("_Signals","")} {row[2]} LONG → SL hit @ ${price:.2f}'
+                        elif price >= tp2:
+                            new_status = 'TP2'
+                            notify_msg = f'🏆 {tab.replace("_Signals","")} {row[2]} LONG → TP2 hit @ ${price:.2f} (+$12.50)'
+                        elif price >= tp1:
+                            new_status = 'TP1_RUN'
+                            notify_msg = f'🎯 {tab.replace("_Signals","")} {row[2]} LONG → TP1 hit @ ${price:.2f} (+$5.00) — runner to TP2'
+                    else:  # SHORT
+                        if price >= sl:
+                            new_status = 'SL'
+                            notify_msg = f'🛑 {tab.replace("_Signals","")} {row[2]} SHORT → SL hit @ ${price:.2f}'
+                        elif price <= tp2:
+                            new_status = 'TP2'
+                            notify_msg = f'🏆 {tab.replace("_Signals","")} {row[2]} SHORT → TP2 hit @ ${price:.2f} (+$12.50)'
+                        elif price <= tp1:
+                            new_status = 'TP1_RUN'
+                            notify_msg = f'🎯 {tab.replace("_Signals","")} {row[2]} SHORT → TP1 hit @ ${price:.2f} (+$5.00) — runner to TP2'
+
+                elif status == 'TP1_RUN':
+                    # Position A already closed at TP1 — Position B running with SL at BE
+                    if direction == 'LONG':
+                        if price <= be:
+                            new_status = 'TP1_BE'
+                            notify_msg = f'⚡ {tab.replace("_Signals","")} {row[2]} LONG → Runner stopped at BE @ ${price:.2f}'
+                        elif price >= tp2:
+                            new_status = 'TP2'
+                            notify_msg = f'🏆 {tab.replace("_Signals","")} {row[2]} LONG → TP2 hit @ ${price:.2f} (+$12.50 total)'
+                    else:
+                        if price >= be:
+                            new_status = 'TP1_BE'
+                            notify_msg = f'⚡ {tab.replace("_Signals","")} {row[2]} SHORT → Runner stopped at BE @ ${price:.2f}'
+                        elif price <= tp2:
+                            new_status = 'TP2'
+                            notify_msg = f'🏆 {tab.replace("_Signals","")} {row[2]} SHORT → TP2 hit @ ${price:.2f} (+$12.50 total)'
+
+                if new_status != status:
+                    sheet_row = i + 2  # row 1 = header
+                    updates.append((sheet_row, new_status))
+                    if notify_msg:
+                        send_telegram(notify_msg)
+                        log.info(f'Status update: {notify_msg}')
+
+            # Batch update all changed rows
+            for sheet_row, new_status in updates:
+                gs_request('PUT',
+                    f'/values/{tab}!L{sheet_row}?valueInputOption=RAW',
+                    {'values': [[new_status]]}
+                )
+                time.sleep(0.3)
+
+            if updates:
+                log.info(f'Updated {len(updates)} signal status(es) in {tab}')
+
+        except Exception as e:
+            log.warning(f'update_open_signals_status {tab}: {e}')
+
+
 def scan():
     """Main scan — fetch 5m data, run strategies, write candles to Sheets."""
     log.info(f'Scanning… [{wib_str()}]')
     refresh_htf()
+
+    xau_current_price = None
+    btc_current_price = None
 
     # ── XAU/USD ──
     if ENABLE_XAU and TWELVE_DATA_KEY:
@@ -963,19 +1075,17 @@ def scan():
             time.sleep(0.8)
             xau_5m = fetch_twelve_data('XAU/USD', '5min', 50)
             if xau_5m:
-                price = xau_5m[-1]['close']
-                log.info(f'XAU/USD: ${price:.2f}')
+                xau_current_price = xau_5m[-1]['close']
+                log.info(f'XAU/USD: ${xau_current_price:.2f}')
 
                 # Write candles to Sheets for Signal Lab app to read
                 write_candles_to_sheets('XAU_5M', xau_5m)
                 if htf_cache['xau_1h']: write_candles_to_sheets('XAU_1H', htf_cache['xau_1h'])
                 if htf_cache['xau_4h']: write_candles_to_sheets('XAU_4H', htf_cache['xau_4h'])
 
-                # HTF bias
                 b4h = compute_bias(htf_cache['xau_4h']) if htf_cache['xau_4h'] else 'neut'
                 b1h = compute_bias(htf_cache['xau_1h']) if htf_cache['xau_1h'] else 'neut'
 
-                # Run strategies
                 all_alerts = []
                 all_alerts += run_silver_bullet(xau_5m, 'XAU/USD', XAU_SL_DIST, XAU_POS_A, XAU_POS_B)
                 all_alerts += run_cisd(xau_5m, 'XAU/USD')
@@ -995,7 +1105,6 @@ def scan():
                         htf, vo, pos_a, pos_b, a_gain, b_gain, note
                     )
                     send_telegram(msg)
-                    # Write to Google Sheets so HTML app can load it
                     write_signal_to_sheets(
                         'XAU/USD', strat_name, direction,
                         entry, lvl['sl'], lvl['tp1'], lvl['tp2'], lvl['be'],
@@ -1010,10 +1119,9 @@ def scan():
         try:
             btc_5m = fetch_binance('BTCUSDT', '5m', 50)
             if btc_5m:
-                price = btc_5m[-1]['close']
-                log.info(f'BTC/USDT: ${price:,.0f}')
+                btc_current_price = btc_5m[-1]['close']
+                log.info(f'BTC/USDT: ${btc_current_price:,.0f}')
 
-                # Write candles to Sheets for Signal Lab app to read
                 write_candles_to_sheets('BTC_5M', btc_5m)
                 if htf_cache['btc_1h']: write_candles_to_sheets('BTC_1H', htf_cache['btc_1h'])
                 if htf_cache['btc_4h']: write_candles_to_sheets('BTC_4H', htf_cache['btc_4h'])
@@ -1040,7 +1148,6 @@ def scan():
                         htf, vo, pos_a, pos_b, a_gain, b_gain, note
                     )
                     send_telegram(msg)
-                    # Write to Google Sheets so HTML app can load it
                     write_signal_to_sheets(
                         'BTC/USDT', strat_name, direction,
                         entry, lvl['sl'], lvl['tp1'], lvl['tp2'], lvl['be'],
@@ -1050,8 +1157,10 @@ def scan():
         except Exception as e:
             log.error(f'BTC scan error: {e}')
 
-# ══════════════════════════════════════════════════════════════
-#  STARTUP + SCHEDULER
+    # ── UPDATE OPEN SIGNAL STATUSES ──
+    # Check every OPEN/TP1_RUN signal in Sheet against current prices
+    # Sends Telegram alert when SL/TP1/TP2 is hit
+    update_open_signals_status(xau_current_price, btc_current_price)
 # ══════════════════════════════════════════════════════════════
 
 def startup_message():
