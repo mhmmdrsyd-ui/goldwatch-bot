@@ -548,6 +548,53 @@ def htf_aligned(direction, b4h, b1h):
     return '❌ AGAINST HTF bias'
 
 # ══════════════════════════════════════════════════════════════
+#  WRITE CANDLES TO SHEETS — Signal Lab app reads from here
+#  Tab names: XAU_5M, XAU_1H, XAU_4H, BTC_5M, BTC_1H, BTC_4H
+# ══════════════════════════════════════════════════════════════
+
+def ensure_candle_tab(tab_name):
+    """Create candle sheet tab if it doesn't exist."""
+    try:
+        meta = gs_request('GET', '')
+        if not meta:
+            return
+        existing = [s['properties']['title'] for s in meta.get('sheets', [])]
+        if tab_name not in existing:
+            gs_request('POST', ':batchUpdate', {
+                'requests': [{'addSheet': {'properties': {'title': tab_name}}}]
+            })
+            log.info(f'Created candle tab: {tab_name}')
+    except Exception as e:
+        log.warning(f'ensure_candle_tab {tab_name}: {e}')
+
+def write_candles_to_sheets(tab_name, candles):
+    """Overwrite a sheet tab with latest candle data.
+    Signal Lab app reads these instead of calling blocked APIs.
+    Columns: datetime, open, high, low, close
+    """
+    if not GS_SERVICE_JSON or not candles:
+        return
+    try:
+        ensure_candle_tab(tab_name)
+        rows = [['datetime', 'open', 'high', 'low', 'close']]
+        for c in candles[-50:]:  # latest 50 candles only
+            rows.append([
+                c['datetime'],
+                round(c['open'],  4),
+                round(c['high'],  4),
+                round(c['low'],   4),
+                round(c['close'], 4),
+            ])
+        # Clear old data and write fresh
+        gs_request('PUT',
+            f'/values/{tab_name}!A1:E{len(rows)}?valueInputOption=RAW',
+            {'values': rows}
+        )
+        log.info(f'Candles → Sheets ({tab_name}: {len(rows)-1} candles)')
+    except Exception as e:
+        log.warning(f'write_candles_to_sheets {tab_name}: {e}')
+
+# ══════════════════════════════════════════════════════════════
 #  VWAP + ORB
 # ══════════════════════════════════════════════════════════════
 
@@ -906,7 +953,7 @@ def refresh_htf():
     htf_cache['last_htf'] = now
 
 def scan():
-    """Main scan — fetch 5m data and run all strategies."""
+    """Main scan — fetch 5m data, run strategies, write candles to Sheets."""
     log.info(f'Scanning… [{wib_str()}]')
     refresh_htf()
 
@@ -918,6 +965,11 @@ def scan():
             if xau_5m:
                 price = xau_5m[-1]['close']
                 log.info(f'XAU/USD: ${price:.2f}')
+
+                # Write candles to Sheets for Signal Lab app to read
+                write_candles_to_sheets('XAU_5M', xau_5m)
+                if htf_cache['xau_1h']: write_candles_to_sheets('XAU_1H', htf_cache['xau_1h'])
+                if htf_cache['xau_4h']: write_candles_to_sheets('XAU_4H', htf_cache['xau_4h'])
 
                 # HTF bias
                 b4h = compute_bias(htf_cache['xau_4h']) if htf_cache['xau_4h'] else 'neut'
@@ -960,6 +1012,11 @@ def scan():
             if btc_5m:
                 price = btc_5m[-1]['close']
                 log.info(f'BTC/USDT: ${price:,.0f}')
+
+                # Write candles to Sheets for Signal Lab app to read
+                write_candles_to_sheets('BTC_5M', btc_5m)
+                if htf_cache['btc_1h']: write_candles_to_sheets('BTC_1H', htf_cache['btc_1h'])
+                if htf_cache['btc_4h']: write_candles_to_sheets('BTC_4H', htf_cache['btc_4h'])
 
                 b4h = compute_bias(htf_cache['btc_4h']) if htf_cache['btc_4h'] else 'neut'
                 b1h = compute_bias(htf_cache['btc_1h']) if htf_cache['btc_1h'] else 'neut'

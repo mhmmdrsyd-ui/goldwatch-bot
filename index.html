@@ -492,8 +492,8 @@ body {
       <input class="api-input" id="xauKey" type="password" placeholder="Paste Twelve Data key…" autocomplete="off">
     </div>
     <div class="api-input-wrap">
-      <div class="api-label">BTC SOURCE — Bybit/OKX (no key needed)</div>
-      <input class="api-input" value="Auto — Bybit → OKX fallback" disabled style="opacity:0.5">
+      <div class="api-label">BTC SOURCE — via Google Sheets (bot writes, app reads)</div>
+      <input class="api-input" value="Auto — GitHub Actions bot → Google Sheet → App" disabled style="opacity:0.5">
     </div>
     <button class="save-btn" onclick="saveSettings()">Save & Connect</button>
   </div>
@@ -709,73 +709,86 @@ async function doScan() {
 }
 
 // ════════════════════════════════════════════════════
-//  DATA FETCHING
+//  DATA FETCHING — via Google Sheets (bypasses Kominfo)
+//  The GitHub Actions bot writes candles to the Sheet
+//  every 5 minutes. We read from there instead of
+//  calling blocked APIs directly.
 // ════════════════════════════════════════════════════
-async function fetchTwelveData(interval, outputsize=50) {
-  if (!xauKey) return [];
-  const url = `https://api.twelvedata.com/time_series?symbol=XAU/USD&interval=${interval}&outputsize=${outputsize}&apikey=${xauKey}`;
-  const res  = await fetch(url);
-  const json = await res.json();
-  if (json.status==='error'||!json.values) return [];
-  return json.values.slice().reverse().map(v=>({
-    datetime:v.datetime, open:+v.open, high:+v.high, low:+v.low, close:+v.close
-  }));
+const SHEET_ID   = '1JCJqRfANlV9afimJeW1jnFAJi27oTqjPWwy7b0LdjfY';
+const SHEET_BASE = `https://docs.google.com/spreadsheets/d/${SHEET_ID}/gviz/tq?tqx=out:json&sheet=`;
+
+// Google Sheets public read via gviz endpoint (no auth needed for read)
+async function fetchSheetCandles(tabName) {
+  try {
+    const url = SHEET_BASE + encodeURIComponent(tabName);
+    const res  = await fetch(url);
+    const text = await res.text();
+    // gviz response is wrapped: google.visualization.Query.setResponse({...})
+    const json = JSON.parse(text.replace(/^[^{]+/, '').replace(/\);?\s*$/, ''));
+    const rows = json?.table?.rows || [];
+    if (!rows.length) return [];
+    // Columns: datetime, open, high, low, close, interval
+    return rows.map(r => ({
+      datetime: r.c[0]?.v || '',
+      open:     parseFloat(r.c[1]?.v) || 0,
+      high:     parseFloat(r.c[2]?.v) || 0,
+      low:      parseFloat(r.c[3]?.v) || 0,
+      close:    parseFloat(r.c[4]?.v) || 0,
+    })).filter(c => c.datetime && c.close > 0);
+  } catch(e) {
+    console.warn(`Sheet fetch ${tabName} failed:`, e.message);
+    return [];
+  }
 }
 
-async function fetchBybit(interval, limit=50) {
-  const imap={'5m':'5','15m':'15','1h':'60','4h':'240'};
+// Also try Twelve Data directly for XAU (works if not rate limited)
+async function fetchTwelveData(interval, outputsize=50) {
+  if (!xauKey) return [];
   try {
-    const res = await fetch(`https://api.bybit.com/v5/market/kline?category=spot&symbol=BTCUSDT&interval=${imap[interval]||'5'}&limit=${limit}`);
-    if (res.ok) {
-      const d = await res.json();
-      const rows = d?.result?.list||[];
-      if (rows.length) return rows.slice().reverse().map(k=>({
-        datetime:new Date(+k[0]).toISOString().replace('T',' ').slice(0,16),
-        open:+k[1],high:+k[2],low:+k[3],close:+k[4]
-      }));
-    }
-  } catch(e) {}
-  // OKX fallback
-  const omap={'5m':'5m','1h':'1H','4h':'4H'};
-  const res2 = await fetch(`https://www.okx.com/api/v5/market/candles?instId=BTC-USDT&bar=${omap[interval]||'5m'}&limit=${limit}`);
-  if (res2.ok) {
-    const d2 = await res2.json();
-    const rows2 = d2?.data||[];
-    return rows2.slice().reverse().map(k=>({
-      datetime:new Date(+k[0]).toISOString().replace('T',' ').slice(0,16),
-      open:+k[1],high:+k[2],low:+k[3],close:+k[4]
+    const url = `https://api.twelvedata.com/time_series?symbol=XAU/USD&interval=${interval}&outputsize=${outputsize}&apikey=${xauKey}`;
+    const res  = await fetch(url, {signal: AbortSignal.timeout(8000)});
+    const json = await res.json();
+    if (json.status==='error'||!json.values) return [];
+    return json.values.slice().reverse().map(v=>({
+      datetime:v.datetime, open:+v.open, high:+v.high, low:+v.low, close:+v.close
     }));
+  } catch(e) {
+    console.warn('Twelve Data direct failed, using Sheet fallback');
+    return [];
   }
-  return [];
 }
 
 async function fetchHTF() {
-  const results = await Promise.allSettled([
-    settings.xau && xauKey ? fetchTwelveData('1h',50) : Promise.resolve([]),
-    settings.xau && xauKey ? fetchTwelveData('4h',50) : Promise.resolve([]),
-    settings.btc ? fetchBybit('1h',50) : Promise.resolve([]),
-    settings.btc ? fetchBybit('4h',50) : Promise.resolve([]),
-  ]);
-  htfCache.xau1h = results[0].value||[];
-  htfCache.xau4h = results[1].value||[];
-  htfCache.btc1h = results[2].value||[];
-  htfCache.btc4h = results[3].value||[];
-  xauBiases.b1h = computeBias(htfCache.xau1h);
-  xauBiases.b4h = computeBias(htfCache.xau4h);
-  btcBiases.b1h = computeBias(htfCache.btc1h);
-  btcBiases.b4h = computeBias(htfCache.btc4h);
+  // Try direct Twelve Data first for XAU HTF, fall back to Sheet
+  let xau1h = settings.xau ? await fetchTwelveData('1h',50) : [];
+  let xau4h = settings.xau ? await fetchTwelveData('4h',50) : [];
+  // If direct failed, load from Sheet
+  if (!xau1h.length && settings.xau) xau1h = await fetchSheetCandles('XAU_1H');
+  if (!xau4h.length && settings.xau) xau4h = await fetchSheetCandles('XAU_4H');
+  // BTC HTF always from Sheet (Bybit/OKX blocked)
+  const btc1h = settings.btc ? await fetchSheetCandles('BTC_1H') : [];
+  const btc4h = settings.btc ? await fetchSheetCandles('BTC_4H') : [];
+
+  htfCache.xau1h = xau1h; htfCache.xau4h = xau4h;
+  htfCache.btc1h = btc1h; htfCache.btc4h = btc4h;
+  xauBiases.b1h = computeBias(xau1h); xauBiases.b4h = computeBias(xau4h);
+  btcBiases.b1h = computeBias(btc1h); btcBiases.b4h = computeBias(btc4h);
 }
 
 async function fetchAll5m() {
-  if (settings.xau && xauKey) {
-    const d = await fetchTwelveData('5min',50);
+  // XAU: try direct Twelve Data, fall back to Sheet
+  if (settings.xau) {
+    let d = await fetchTwelveData('5min', 50);
+    if (!d.length) d = await fetchSheetCandles('XAU_5M');
     if (d.length) xau5m = d;
   }
+  // BTC: always from Sheet (direct sources blocked by Kominfo)
   if (settings.btc) {
-    const d = await fetchBybit('5m',50);
+    const d = await fetchSheetCandles('BTC_5M');
     if (d.length) btc5m = d;
   }
-  // Update prices in UI
+
+  // Update price displays
   if (xau5m.length) {
     const p = xau5m[xau5m.length-1].close;
     document.getElementById('xauPrice').textContent = '$'+p.toFixed(2);
@@ -789,8 +802,8 @@ async function fetchAll5m() {
     document.getElementById('bias1h').textContent = bArr[xauBiases.b1h]||'—';
     document.getElementById('bias1h').className   = 'bias-chip-val '+xauBiases.b1h;
     const bCls={'bull':'up','bear':'dn','neut':''};
-    document.getElementById('xauBias').textContent  = bArr[xauBiases.b1h];
-    document.getElementById('xauBias').className    = 'pair-change '+bCls[xauBiases.b1h];
+    document.getElementById('xauBias').textContent = bArr[xauBiases.b1h];
+    document.getElementById('xauBias').className   = 'pair-change '+bCls[xauBiases.b1h];
   }
   if (btc5m.length) {
     const p = btc5m[btc5m.length-1].close;
@@ -800,6 +813,11 @@ async function fetchAll5m() {
     const bCls={'bull':'up','bear':'dn','neut':''};
     document.getElementById('btcBias').textContent = bArr[btcBiases.b1h];
     document.getElementById('btcBias').className   = 'pair-change '+bCls[btcBiases.b1h];
+  }
+
+  // If nothing loaded, throw so doScan shows error
+  if (!xau5m.length && !btc5m.length) {
+    throw new Error('No candle data — bot may not have written to Sheet yet');
   }
 }
 
