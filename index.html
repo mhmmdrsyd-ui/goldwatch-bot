@@ -681,30 +681,34 @@ function stopScan() {
 async function doScan() {
   document.getElementById('connStatus').textContent = 'Fetching…';
   try {
-    // Fetch HTF every 5 min
     const now = Date.now();
     if (now - htfLastFetch > 300000) {
       await fetchHTF();
       htfLastFetch = now;
     }
-    // Fetch 5m data
     await fetchAll5m();
-    // Update status
     document.getElementById('connStatus').textContent = 'Live';
     document.getElementById('connDot').className = 'dot live';
     document.getElementById('lastScan').textContent = 'Updated '+wibStr();
-    // Run strategies
     runStrategies();
-    // Update open signal statuses
     updateStatuses();
-    // Render
     renderLive();
     renderHistory();
     renderSummary();
   } catch(err) {
-    document.getElementById('connDot').className = 'dot err';
-    document.getElementById('connStatus').textContent = 'Error';
-    console.warn('Scan error:', err.message);
+    // If XAU loaded but BTC Sheet not ready yet, still show as partial success
+    if (xau5m.length || btc5m.length) {
+      document.getElementById('connDot').className = 'dot live';
+      document.getElementById('connStatus').textContent = 'Live (partial)';
+      document.getElementById('lastScan').textContent = 'Updated '+wibStr();
+      runStrategies();
+      updateStatuses();
+      renderLive(); renderHistory(); renderSummary();
+    } else {
+      document.getElementById('connDot').className = 'dot err';
+      document.getElementById('connStatus').textContent = 'Error — run bot first';
+    }
+    console.warn('Scan:', err.message);
   }
 }
 
@@ -759,13 +763,12 @@ async function fetchTwelveData(interval, outputsize=50) {
 }
 
 async function fetchHTF() {
-  // Try direct Twelve Data first for XAU HTF, fall back to Sheet
-  let xau1h = settings.xau ? await fetchTwelveData('1h',50) : [];
-  let xau4h = settings.xau ? await fetchTwelveData('4h',50) : [];
-  // If direct failed, load from Sheet
+  // XAU: try direct Twelve Data first, fall back to Sheet
+  let xau1h = settings.xau && xauKey ? await fetchTwelveData('1h',50) : [];
+  let xau4h = settings.xau && xauKey ? await fetchTwelveData('4h',50) : [];
   if (!xau1h.length && settings.xau) xau1h = await fetchSheetCandles('XAU_1H');
   if (!xau4h.length && settings.xau) xau4h = await fetchSheetCandles('XAU_4H');
-  // BTC HTF always from Sheet (Bybit/OKX blocked)
+  // BTC: always from Sheet (Bybit/OKX blocked by Kominfo + CORS)
   const btc1h = settings.btc ? await fetchSheetCandles('BTC_1H') : [];
   const btc4h = settings.btc ? await fetchSheetCandles('BTC_4H') : [];
 
@@ -776,13 +779,17 @@ async function fetchHTF() {
 }
 
 async function fetchAll5m() {
-  // XAU: try direct Twelve Data, fall back to Sheet
-  if (settings.xau) {
+  // XAU: try direct Twelve Data first, fall back to Sheet
+  if (settings.xau && xauKey) {
     let d = await fetchTwelveData('5min', 50);
     if (!d.length) d = await fetchSheetCandles('XAU_5M');
     if (d.length) xau5m = d;
+  } else if (settings.xau) {
+    const d = await fetchSheetCandles('XAU_5M');
+    if (d.length) xau5m = d;
   }
-  // BTC: always from Sheet (direct sources blocked by Kominfo)
+
+  // BTC: ONLY from Sheet — no direct API calls (all blocked/CORS)
   if (settings.btc) {
     const d = await fetchSheetCandles('BTC_5M');
     if (d.length) btc5m = d;
@@ -815,9 +822,9 @@ async function fetchAll5m() {
     document.getElementById('btcBias').className   = 'pair-change '+bCls[btcBiases.b1h];
   }
 
-  // If nothing loaded, throw so doScan shows error
+  // Need at least XAU or BTC to proceed
   if (!xau5m.length && !btc5m.length) {
-    throw new Error('No candle data — bot may not have written to Sheet yet');
+    throw new Error('No candle data yet — run GitHub Actions bot first to populate Sheet');
   }
 }
 
