@@ -558,6 +558,21 @@ const SCAN_MS = 60000;
 const LS_APIKEY  = 'siglab_xau_key';
 const LS_SETTINGS= 'siglab_settings_v1';
 
+// Show a bottom pill notice (defined early so available during load)
+function showNotice(msg) {
+  let n = document.getElementById('_notice');
+  if (!n) {
+    n = document.createElement('div');
+    n.id = '_notice';
+    n.style.cssText = 'position:fixed;bottom:16px;left:50%;transform:translateX(-50%);background:#141b22;border:1px solid #1e2d3a;color:#6a8899;font-family:DM Mono,monospace;font-size:10px;padding:6px 14px;border-radius:20px;z-index:9999;letter-spacing:1px;white-space:nowrap;max-width:90vw;text-align:center;transition:opacity 0.3s;';
+    document.body.appendChild(n);
+  }
+  n.textContent = msg;
+  n.style.opacity = '1';
+  clearTimeout(n._t);
+  n._t = setTimeout(() => { n.style.opacity = '0'; }, 3000);
+}
+
 // Google Sheet config — same sheet used by the bot
 const SHEET_ID   = '1JCJqRfANlV9afimJeW1jnFAJi27oTqjPWwy7b0LdjfY';
 const SHEET_BASE = `https://docs.google.com/spreadsheets/d/${SHEET_ID}/gviz/tq?tqx=out:json&sheet=`;
@@ -582,12 +597,21 @@ let sheetsLoaded = false;
 // ════════════════════════════════════════════════════
 window.addEventListener('load', async () => {
   loadSettings();
-  // Load signals from Google Sheet first (master data source)
-  await loadSignalsFromSheet();
   renderAll();
-  // Auto-start scanning
+  // Load signals from Sheet with a 5s timeout — never block the UI
+  try {
+    await Promise.race([
+      loadSignalsFromSheet(),
+      new Promise((_, rej) => setTimeout(() => rej(new Error('timeout')), 5000))
+    ]);
+  } catch(e) {
+    console.warn('Sheet load skipped:', e.message);
+    showNotice('⚠ Sheet load timed out — open Settings and save key to connect');
+  }
+  renderAll();
+  // Auto-start scanning regardless of Sheet load result
   if (xauKey || settings.btc) {
-    setTimeout(startScan, 800);
+    setTimeout(startScan, 400);
   }
 });
 
@@ -608,54 +632,51 @@ function loadSettings() {
 //  This is the master signal store — same on all devices
 // ════════════════════════════════════════════════════
 async function loadSignalsFromSheet() {
-  showNotice('Loading signal history from Sheet…');
   try {
+    showNotice('Loading signal history…');
     const [xauRows, btcRows] = await Promise.all([
       fetchGvizSheet('XAU_Signals'),
       fetchGvizSheet('BTC_Signals'),
     ]);
-    const allRows = [...xauRows, ...btcRows];
+    const allRows = [...xauRows.map(r=>({r,tab:'XAU_Signals'})), ...btcRows.map(r=>({r,tab:'BTC_Signals'}))];
     if (!allRows.length) {
-      showNotice('No signals in Sheet yet — bot will populate on first run');
+      showNotice('Sheet empty — signals will appear after bot runs');
       return;
     }
-    // Convert sheet rows to signal objects
-    // Columns: Time, Pair, Strategy, Direction, Entry, SL, TP1, TP2, BE, HTF, VWAP, Status
     signals = allRows
-      .filter(r => r && r.length >= 5 && r[4])
-      .map((r, i) => {
+      .filter(({r}) => r && r.length >= 5 && r[4])
+      .map(({r, tab}, i) => {
         const entry = parseFloat(r[4]) || 0;
-        const pair  = r[1] || 'XAU/USD';
-        const dir   = r[3] || 'LONG';
+        const pair  = r[1] || (tab==='XAU_Signals'?'XAU/USD':'BTC/USDT');
         const sl    = parseFloat(r[5]) || 0;
         const tp1   = parseFloat(r[6]) || 0;
         const tp2   = parseFloat(r[7]) || 0;
         const be    = parseFloat(r[8]) || entry;
         const status= (r[11] || 'OPEN').trim();
         return {
-          id:     `sheet_${i}_${entry}`,
+          id:    `sheet_${i}_${entry}`,
           pair,
-          strat:  r[2] || '—',
-          dir,
-          price:  entry,
-          time:   r[0] || '—',
-          date:   new Date().toISOString(),
-          lvl:    { sl, tp1, tp2, be },
-          htf:    { cls: '', txt: r[9] || '—' },
-          vwap:   r[10] || '—',
+          strat: r[2] || '—',
+          dir:   r[3] || 'LONG',
+          price: entry,
+          time:  r[0] || '—',
+          date:  new Date().toISOString(),
+          lvl:   { sl, tp1, tp2, be },
+          htf:   { cls:'', txt: r[9]||'—' },
+          vwap:  r[10] || '—',
           status,
-          pnl:    calcPnl(status),
+          pnl:   calcPnl(status),
           _sheetRow: i + 2,
-          _tab:   allRows.indexOf(r) < xauRows.length ? 'XAU_Signals' : 'BTC_Signals',
+          _tab:  tab,
+          _local: false,
         };
       })
-      .sort((a, b) => b._sheetRow - a._sheetRow); // newest first
-
+      .reverse();
     sheetsLoaded = true;
-    showNotice(`✓ Loaded ${signals.length} signal${signals.length!==1?'s':''} from Sheet`);
+    showNotice(`✓ ${signals.length} signal${signals.length!==1?'s':''} loaded`);
   } catch(e) {
-    console.warn('loadSignalsFromSheet error:', e);
-    showNotice('Could not load from Sheet — make sure it is publicly shared');
+    console.warn('loadSignalsFromSheet:', e.message);
+    showNotice('Could not load Sheet — check sharing settings');
   }
 }
 
@@ -804,8 +825,6 @@ async function doScan() {
 //  every 5 minutes. We read from there instead of
 //  calling blocked APIs directly.
 // ════════════════════════════════════════════════════
-const SHEET_ID   = '1JCJqRfANlV9afimJeW1jnFAJi27oTqjPWwy7b0LdjfY';
-const SHEET_BASE = `https://docs.google.com/spreadsheets/d/${SHEET_ID}/gviz/tq?tqx=out:json&sheet=`;
 
 // Google Sheets public read via gviz endpoint (no auth needed for read)
 async function fetchSheetCandles(tabName) {
@@ -1298,14 +1317,6 @@ function showToast(title, body, type='neutral') {
   d.onclick=()=>d.remove();
   ct.appendChild(d);
   setTimeout(()=>d&&d.parentNode&&d.remove(),8000);
-}
-
-function showNotice(msg) {
-  const n=document.createElement('div');
-  n.style.cssText='position:fixed;bottom:16px;left:50%;transform:translateX(-50%);background:#141b22;border:1px solid #1e2d3a;color:#6a8899;font-family:DM Mono,monospace;font-size:10px;padding:6px 14px;border-radius:20px;z-index:9999;letter-spacing:1px;white-space:nowrap;max-width:90vw;text-align:center;';
-  n.textContent=msg;
-  document.body.appendChild(n);
-  setTimeout(()=>n.remove(),3500);
 }
 
 // ════════════════════════════════════════════════════
