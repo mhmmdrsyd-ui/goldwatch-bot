@@ -555,41 +555,43 @@ const POS_B_GAIN = +(RISK * TP2_M * 0.5).toFixed(2); // $7.50
 const SCAN_MS = 60000;
 
 // Storage keys
-const LS_SIGS    = 'siglab_signals_v1';
 const LS_APIKEY  = 'siglab_xau_key';
 const LS_SETTINGS= 'siglab_settings_v1';
+
+// Google Sheet config — same sheet used by the bot
+const SHEET_ID   = '1JCJqRfANlV9afimJeW1jnFAJi27oTqjPWwy7b0LdjfY';
+const SHEET_BASE = `https://docs.google.com/spreadsheets/d/${SHEET_ID}/gviz/tq?tqx=out:json&sheet=`;
 
 // ════════════════════════════════════════════════════
 //  STATE
 // ════════════════════════════════════════════════════
 let scanning    = false;
 let scanTimer   = null;
-let signals     = [];           // all signals ever
-let cooldown    = {};           // key → timestamp
-let htfCache    = {};           // HTF candles
+let signals     = [];
+let cooldown    = {};
+let htfCache    = {};
 let htfLastFetch= 0;
 let xauKey      = '';
 let settings    = { sb:true, cisd:true, choch:true, xau:true, btc:true };
 let xau5m=[], btc5m=[], xauBiases={b4h:'neut',b1h:'neut'}, btcBiases={b4h:'neut',b1h:'neut'};
 let histFilter  = 'all';
+let sheetsLoaded = false;
 
 // ════════════════════════════════════════════════════
 //  INIT
 // ════════════════════════════════════════════════════
-window.addEventListener('load', () => {
-  loadFromStorage();
+window.addEventListener('load', async () => {
+  loadSettings();
+  // Load signals from Google Sheet first (master data source)
+  await loadSignalsFromSheet();
   renderAll();
-  // Auto-start if key exists
+  // Auto-start scanning
   if (xauKey || settings.btc) {
-    setTimeout(startScan, 600);
+    setTimeout(startScan, 800);
   }
 });
 
-function loadFromStorage() {
-  try {
-    const raw = localStorage.getItem(LS_SIGS);
-    if (raw) signals = JSON.parse(raw);
-  } catch(e) {}
+function loadSettings() {
   try {
     xauKey = localStorage.getItem(LS_APIKEY) || '';
     if (xauKey) document.getElementById('xauKey').value = xauKey;
@@ -600,8 +602,88 @@ function loadFromStorage() {
   } catch(e) {}
 }
 
+// ════════════════════════════════════════════════════
+//  LOAD SIGNALS FROM GOOGLE SHEET (on every page load)
+//  Reads XAU_Signals and BTC_Signals tabs
+//  This is the master signal store — same on all devices
+// ════════════════════════════════════════════════════
+async function loadSignalsFromSheet() {
+  showNotice('Loading signal history from Sheet…');
+  try {
+    const [xauRows, btcRows] = await Promise.all([
+      fetchGvizSheet('XAU_Signals'),
+      fetchGvizSheet('BTC_Signals'),
+    ]);
+    const allRows = [...xauRows, ...btcRows];
+    if (!allRows.length) {
+      showNotice('No signals in Sheet yet — bot will populate on first run');
+      return;
+    }
+    // Convert sheet rows to signal objects
+    // Columns: Time, Pair, Strategy, Direction, Entry, SL, TP1, TP2, BE, HTF, VWAP, Status
+    signals = allRows
+      .filter(r => r && r.length >= 5 && r[4])
+      .map((r, i) => {
+        const entry = parseFloat(r[4]) || 0;
+        const pair  = r[1] || 'XAU/USD';
+        const dir   = r[3] || 'LONG';
+        const sl    = parseFloat(r[5]) || 0;
+        const tp1   = parseFloat(r[6]) || 0;
+        const tp2   = parseFloat(r[7]) || 0;
+        const be    = parseFloat(r[8]) || entry;
+        const status= (r[11] || 'OPEN').trim();
+        return {
+          id:     `sheet_${i}_${entry}`,
+          pair,
+          strat:  r[2] || '—',
+          dir,
+          price:  entry,
+          time:   r[0] || '—',
+          date:   new Date().toISOString(),
+          lvl:    { sl, tp1, tp2, be },
+          htf:    { cls: '', txt: r[9] || '—' },
+          vwap:   r[10] || '—',
+          status,
+          pnl:    calcPnl(status),
+          _sheetRow: i + 2,
+          _tab:   allRows.indexOf(r) < xauRows.length ? 'XAU_Signals' : 'BTC_Signals',
+        };
+      })
+      .sort((a, b) => b._sheetRow - a._sheetRow); // newest first
+
+    sheetsLoaded = true;
+    showNotice(`✓ Loaded ${signals.length} signal${signals.length!==1?'s':''} from Sheet`);
+  } catch(e) {
+    console.warn('loadSignalsFromSheet error:', e);
+    showNotice('Could not load from Sheet — make sure it is publicly shared');
+  }
+}
+
+function calcPnl(status) {
+  if (status === 'TP2')    return POS_A_GAIN + POS_B_GAIN;
+  if (status === 'TP1_RUN'||status === 'TP1_BE') return POS_A_GAIN;
+  if (status === 'SL')     return -RISK;
+  return 0;
+}
+
+async function fetchGvizSheet(tabName) {
+  try {
+    const url  = SHEET_BASE + encodeURIComponent(tabName);
+    const res  = await fetch(url);
+    const text = await res.text();
+    const json = JSON.parse(text.replace(/^[^{]+/, '').replace(/\);?\s*$/, ''));
+    const rows = json?.table?.rows || [];
+    // Skip header row — return raw cell values
+    return rows.map(r => r.c.map(cell => cell?.v?.toString() || ''));
+  } catch(e) {
+    console.warn(`fetchGvizSheet ${tabName}:`, e.message);
+    return [];
+  }
+}
+
 function saveToStorage() {
-  try { localStorage.setItem(LS_SIGS, JSON.stringify(signals.slice(0,500))); } catch(e) {}
+  // Signals are stored in Google Sheet (by bot) — no localStorage needed for signals
+  // localStorage only used for settings/key
 }
 
 function saveSettings() {
@@ -678,13 +760,21 @@ function stopScan() {
   document.getElementById('connStatus').textContent = 'Offline';
 }
 
+let lastSheetReload = 0;
+
 async function doScan() {
   document.getElementById('connStatus').textContent = 'Fetching…';
   try {
     const now = Date.now();
+    // Reload HTF candles every 5 min
     if (now - htfLastFetch > 300000) {
       await fetchHTF();
       htfLastFetch = now;
+    }
+    // Reload signals from Sheet every 5 min to pick up bot updates
+    if (now - lastSheetReload > 300000) {
+      await loadSignalsFromSheet();
+      lastSheetReload = now;
     }
     await fetchAll5m();
     document.getElementById('connStatus').textContent = 'Live';
@@ -692,17 +782,13 @@ async function doScan() {
     document.getElementById('lastScan').textContent = 'Updated '+wibStr();
     runStrategies();
     updateStatuses();
-    renderLive();
-    renderHistory();
-    renderSummary();
+    renderLive(); renderHistory(); renderSummary();
   } catch(err) {
-    // If XAU loaded but BTC Sheet not ready yet, still show as partial success
     if (xau5m.length || btc5m.length) {
       document.getElementById('connDot').className = 'dot live';
       document.getElementById('connStatus').textContent = 'Live (partial)';
       document.getElementById('lastScan').textContent = 'Updated '+wibStr();
-      runStrategies();
-      updateStatuses();
+      runStrategies(); updateStatuses();
       renderLive(); renderHistory(); renderSummary();
     } else {
       document.getElementById('connDot').className = 'dot err';
@@ -902,6 +988,10 @@ function runStrategies() {
 function fireSignal(pair, strat, dir, price, sl_dist, biases, note='') {
   const key=`${pair}|${strat}|${dir}|${Math.round(price/(pair==='XAU/USD'?1:50))}`;
   if(!isCooled(key)) return;
+  // Skip if a very similar signal already exists from Sheet (within $1 for Gold, $50 for BTC)
+  const tol = pair==='XAU/USD'?1:50;
+  const already = signals.some(s=>s.pair===pair&&s.strat===strat&&s.dir===dir&&Math.abs(s.price-price)<tol&&s.status==='OPEN');
+  if(already) return;
   const lvl=calcLevels(price,dir,sl_dist);
   const htf=htfAlignLabel(dir,biases.b4h,biases.b1h);
   const vwap=pair==='XAU/USD'?getVWAPBias(xau5m):getVWAPBias(btc5m);
@@ -912,14 +1002,15 @@ function fireSignal(pair, strat, dir, price, sl_dist, biases, note='') {
     status:'OPEN', htf, vwap, note,
     posAStatus:'open', posBStatus:'open',
     pnl:0,
+    _local: true, // flagged as locally detected (not from Sheet)
   };
   signals.unshift(sig);
-  saveToStorage();
   showToast(
     `${dir==='LONG'?'🟢':'🔴'} ${pair} — ${strat}`,
     `Entry: ${fmtP(price,pair)}\nSL: ${fmtP(lvl.sl,pair)} · TP1: ${fmtP(lvl.tp1,pair)}\n${htf.txt}`,
     dir.toLowerCase()
   );
+  renderLive(); renderHistory(); renderSummary();
 }
 
 function runSB(candles, pair, slDist, biases) {
@@ -990,31 +1081,34 @@ function lastBullBefore(idx,c){for(let i=idx-1;i>=0;i--)if(c[i].close>c[i].open)
 //  STATUS TRACKING — check if OPEN signals hit SL/TP
 // ════════════════════════════════════════════════════
 function updateStatuses() {
+  // For Sheet-loaded signals: pnl is derived from status (set by bot)
+  // For local signals: check current price against levels
   const prices={'XAU/USD': xau5m.length?xau5m[xau5m.length-1].close:null, 'BTC/USDT': btc5m.length?btc5m[btc5m.length-1].close:null};
-  let changed=false;
   signals.forEach(s=>{
+    // Always sync pnl from status for Sheet signals
+    if(!s._local) { s.pnl = calcPnl(s.status); return; }
+    // For local (app-detected) signals, check price
     const price=prices[s.pair]; if(!price) return;
     if(s.status==='OPEN'){
       if(s.dir==='LONG'){
-        if(price<=s.lvl.sl){s.status='SL';s.pnl=-RISK;changed=true;}
-        else if(price>=s.lvl.tp2){s.status='TP2';s.pnl=POS_A_GAIN+POS_B_GAIN;changed=true;}
-        else if(price>=s.lvl.tp1){s.status='TP1_RUN';s.posAStatus='closed';s.pnl=POS_A_GAIN;changed=true;}
+        if(price<=s.lvl.sl){s.status='SL';s.pnl=-RISK;}
+        else if(price>=s.lvl.tp2){s.status='TP2';s.pnl=POS_A_GAIN+POS_B_GAIN;}
+        else if(price>=s.lvl.tp1){s.status='TP1_RUN';s.pnl=POS_A_GAIN;}
       } else {
-        if(price>=s.lvl.sl){s.status='SL';s.pnl=-RISK;changed=true;}
-        else if(price<=s.lvl.tp2){s.status='TP2';s.pnl=POS_A_GAIN+POS_B_GAIN;changed=true;}
-        else if(price<=s.lvl.tp1){s.status='TP1_RUN';s.posAStatus='closed';s.pnl=POS_A_GAIN;changed=true;}
+        if(price>=s.lvl.sl){s.status='SL';s.pnl=-RISK;}
+        else if(price<=s.lvl.tp2){s.status='TP2';s.pnl=POS_A_GAIN+POS_B_GAIN;}
+        else if(price<=s.lvl.tp1){s.status='TP1_RUN';s.pnl=POS_A_GAIN;}
       }
     } else if(s.status==='TP1_RUN'){
       if(s.dir==='LONG'){
-        if(price<=s.lvl.be){s.status='TP1_BE';s.pnl=POS_A_GAIN;changed=true;}
-        else if(price>=s.lvl.tp2){s.status='TP2';s.pnl=POS_A_GAIN+POS_B_GAIN;changed=true;}
+        if(price<=s.lvl.be){s.status='TP1_BE';s.pnl=POS_A_GAIN;}
+        else if(price>=s.lvl.tp2){s.status='TP2';s.pnl=POS_A_GAIN+POS_B_GAIN;}
       } else {
-        if(price>=s.lvl.be){s.status='TP1_BE';s.pnl=POS_A_GAIN;changed=true;}
-        else if(price<=s.lvl.tp2){s.status='TP2';s.pnl=POS_A_GAIN+POS_B_GAIN;changed=true;}
+        if(price>=s.lvl.be){s.status='TP1_BE';s.pnl=POS_A_GAIN;}
+        else if(price<=s.lvl.tp2){s.status='TP2';s.pnl=POS_A_GAIN+POS_B_GAIN;}
       }
     }
   });
-  if(changed) saveToStorage();
 }
 
 // ════════════════════════════════════════════════════
@@ -1206,13 +1300,21 @@ function showToast(title, body, type='neutral') {
   setTimeout(()=>d&&d.parentNode&&d.remove(),8000);
 }
 
+function showNotice(msg) {
+  const n=document.createElement('div');
+  n.style.cssText='position:fixed;bottom:16px;left:50%;transform:translateX(-50%);background:#141b22;border:1px solid #1e2d3a;color:#6a8899;font-family:DM Mono,monospace;font-size:10px;padding:6px 14px;border-radius:20px;z-index:9999;letter-spacing:1px;white-space:nowrap;max-width:90vw;text-align:center;';
+  n.textContent=msg;
+  document.body.appendChild(n);
+  setTimeout(()=>n.remove(),3500);
+}
+
 // ════════════════════════════════════════════════════
 //  CLEAR ALL
 // ════════════════════════════════════════════════════
 function clearAll() {
-  if(!confirm('Clear all signal data? This cannot be undone.')) return;
-  signals=[];cooldown={};saveToStorage();renderAll();
-  showToast('Cleared','All signal data removed','neutral');
+  if(!confirm('Clear local view? (Sheet data is preserved — reload to restore from Sheet)')) return;
+  signals=[];cooldown={};renderAll();
+  showToast('Cleared','Reload page to restore from Sheet','neutral');
 }
 
 // ════════════════════════════════════════════════════
